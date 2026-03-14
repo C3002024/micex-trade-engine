@@ -91,5 +91,5 @@ app.post('/sync', async (req, res) => {
 app.listen(PORT, () => {
   console.log(`[RAILWAY] Trade Engine running on port ${PORT}`);
   syncOpenTrades();
-  setInterval(syncOpenTrades, 120000);
+  setInterval(syncOpenTrades, 30000);
 });
