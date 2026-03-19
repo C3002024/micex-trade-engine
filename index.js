@@ -259,40 +259,82 @@ async function sendTelegram(text) {
 }
 
 async function getBTCData() {
+  // 10 nguồn giá — ưu tiên API không chặn datacenter IP
   const sources = [
+    // CoinCap — rất ổn định, không chặn IP
+    { url: 'https://api.coincap.io/v2/assets/bitcoin', parse: d => ({ price: parseFloat(d?.data?.priceUsd), change24h: parseFloat(d?.data?.changePercent24Hr)||0, high24h: parseFloat(d?.data?.priceUsd)*1.005, low24h: parseFloat(d?.data?.priceUsd)*0.995, volume24h: parseFloat(d?.data?.volumeUsd24Hr)||0 }) },
+    // Kraken — không chặn datacenter
+    { url: 'https://api.kraken.com/0/public/Ticker?pair=XBTUSD', parse: d => { const t=d?.result?.XXBTZUSD||d?.result?.XBTUSD; if(!t) return {price:0}; return { price: parseFloat(t.c?.[0]), change24h: ((parseFloat(t.c?.[0])-parseFloat(t.o))/parseFloat(t.o))*100, high24h: parseFloat(t.h?.[1]), low24h: parseFloat(t.l?.[1]), volume24h: parseFloat(t.v?.[1])*parseFloat(t.c?.[0]) }; } },
+    // CryptoCompare — ổn định
+    { url: 'https://min-api.cryptocompare.com/data/pricemultifull?fsyms=BTC&tsyms=USD', parse: d => { const r=d?.RAW?.BTC?.USD; if(!r) return {price:0}; return { price: r.PRICE, change24h: r.CHANGEPCT24HOUR||0, high24h: r.HIGH24HOUR||0, low24h: r.LOW24HOUR||0, volume24h: r.TOTALVOLUME24HTO||0 }; } },
+    // Binance
     { url: 'https://api.binance.com/api/v3/ticker/24hr?symbol=BTCUSDT', parse: d => ({ price: parseFloat(d.lastPrice), change24h: parseFloat(d.priceChangePercent), high24h: parseFloat(d.highPrice), low24h: parseFloat(d.lowPrice), volume24h: parseFloat(d.quoteVolume) }) },
+    // Bybit
     { url: 'https://api.bybit.com/v5/market/tickers?category=linear&symbol=BTCUSDT', parse: d => { const t=d?.result?.list?.[0]; return { price: parseFloat(t?.lastPrice), change24h: parseFloat(t?.price24hPcnt)*100, high24h: parseFloat(t?.highPrice24h), low24h: parseFloat(t?.lowPrice24h), volume24h: parseFloat(t?.turnover24h) }; } },
-    { url: 'https://api.coingecko.com/api/v3/simple/price?ids=bitcoin&vs_currencies=usd&include_24hr_change=true&include_24hr_vol=true', parse: d => ({ price: d.bitcoin.usd, change24h: d.bitcoin.usd_24h_change||0, high24h: d.bitcoin.usd*1.01, low24h: d.bitcoin.usd*0.99, volume24h: d.bitcoin.usd_24h_vol||0 }) },
+    // OKX
+    { url: 'https://www.okx.com/api/v5/market/ticker?instId=BTC-USDT', parse: d => { const t=d?.data?.[0]; if(!t) return {price:0}; return { price: parseFloat(t.last), change24h: ((parseFloat(t.last)-parseFloat(t.open24h))/parseFloat(t.open24h))*100, high24h: parseFloat(t.high24h), low24h: parseFloat(t.low24h), volume24h: parseFloat(t.volCcy24h) }; } },
+    // Gate.io
+    { url: 'https://api.gateio.ws/api/v4/spot/tickers?currency_pair=BTC_USDT', parse: d => { const t=Array.isArray(d)?d[0]:null; if(!t) return {price:0}; return { price: parseFloat(t.last), change24h: parseFloat(t.change_percentage)||0, high24h: parseFloat(t.high_24h)||0, low24h: parseFloat(t.low_24h)||0, volume24h: parseFloat(t.quote_volume)||0 }; } },
+    // MEXC
+    { url: 'https://api.mexc.com/api/v3/ticker/24hr?symbol=BTCUSDT', parse: d => ({ price: parseFloat(d.lastPrice), change24h: parseFloat(d.priceChangePercent)||0, high24h: parseFloat(d.highPrice)||0, low24h: parseFloat(d.lowPrice)||0, volume24h: parseFloat(d.quoteVolume)||0 }) },
+    // CoinGecko
+    { url: 'https://api.coingecko.com/api/v3/simple/price?ids=bitcoin&vs_currencies=usd&include_24hr_change=true&include_24hr_vol=true&include_24hr_high_low=true', parse: d => ({ price: d.bitcoin.usd, change24h: d.bitcoin.usd_24h_change||0, high24h: d.bitcoin.usd_24h_high||d.bitcoin.usd*1.01, low24h: d.bitcoin.usd_24h_low||d.bitcoin.usd*0.99, volume24h: d.bitcoin.usd_24h_vol||0 }) },
+    // Blockchain.info — backup đơn giản
+    { url: 'https://blockchain.info/ticker', parse: d => ({ price: d?.USD?.last||0, change24h: 0, high24h: d?.USD?.last*1.005||0, low24h: d?.USD?.last*0.995||0, volume24h: 0 }) },
   ];
+  
+  // Fire ALL in parallel — first valid wins
+  const results = await Promise.allSettled(sources.map(async (src) => {
+    const controller = new AbortController();
+    const t = setTimeout(() => controller.abort(), 6000);
+    try {
+      const res = await fetch(src.url, { signal: controller.signal });
+      clearTimeout(t);
+      if (res.ok) { const data = await res.json(); const r = src.parse(data); if (r && r.price > 0) return r; }
+    } catch (_) { clearTimeout(t); }
+    return null;
+  }));
+  
+  for (const r of results) {
+    if (r.status === 'fulfilled' && r.value && r.value.price > 0) {
+      console.log('[SIGNAL] Price source OK:', r.value.price);
+      return r.value;
+    }
+  }
+  console.log('[SIGNAL] ALL 10 price sources failed!');
+  return null;
+}
+
+async function getKlines() {
+  const sources = [
+    // CryptoCompare — không chặn datacenter IP
+    { url: 'https://min-api.cryptocompare.com/data/v2/histominute?fsym=BTC&tsym=USD&limit=30', parse: d => d?.Data?.Data?.map(k => ({ close: k.close, high: k.high, low: k.low, volume: k.volumeto })) },
+    // Binance
+    { url: 'https://api.binance.com/api/v3/klines?symbol=BTCUSDT&interval=1m&limit=30', parse: d => Array.isArray(d) ? d.map(k => ({ close: parseFloat(k[4]), high: parseFloat(k[2]), low: parseFloat(k[3]), volume: parseFloat(k[5]) })) : null },
+    // Binance futures
+    { url: 'https://fapi.binance.com/fapi/v1/klines?symbol=BTCUSDT&interval=1m&limit=30', parse: d => Array.isArray(d) ? d.map(k => ({ close: parseFloat(k[4]), high: parseFloat(k[2]), low: parseFloat(k[3]), volume: parseFloat(k[5]) })) : null },
+    // Bybit
+    { url: 'https://api.bybit.com/v5/market/kline?category=linear&symbol=BTCUSDT&interval=1&limit=30', parse: d => d?.result?.list?.reverse().map(k => ({ close: parseFloat(k[4]), high: parseFloat(k[2]), low: parseFloat(k[3]), volume: parseFloat(k[5]) })) },
+    // OKX
+    { url: 'https://www.okx.com/api/v5/market/candles?instId=BTC-USDT&bar=1m&limit=30', parse: d => d?.data?.reverse().map(k => ({ close: parseFloat(k[4]), high: parseFloat(k[2]), low: parseFloat(k[3]), volume: parseFloat(k[5]) })) },
+  ];
+  
   for (const src of sources) {
     try {
       const controller = new AbortController();
       const t = setTimeout(() => controller.abort(), 6000);
       const res = await fetch(src.url, { signal: controller.signal });
       clearTimeout(t);
-      if (res.ok) { const data = await res.json(); const r = src.parse(data); if (r.price > 0) return r; }
-    } catch (_) {}
-  }
-  return null;
-}
-
-async function getKlines() {
-  const urls = [
-    'https://api.binance.com/api/v3/klines?symbol=BTCUSDT&interval=1m&limit=30',
-    'https://fapi.binance.com/fapi/v1/klines?symbol=BTCUSDT&interval=1m&limit=30',
-  ];
-  for (const url of urls) {
-    try {
-      const controller = new AbortController();
-      const t = setTimeout(() => controller.abort(), 6000);
-      const res = await fetch(url, { signal: controller.signal });
-      clearTimeout(t);
+      if (!res.ok) continue;
       const data = await res.json();
-      if (Array.isArray(data) && data.length > 0) {
-        return data.map(k => ({ close: parseFloat(k[4]), high: parseFloat(k[2]), low: parseFloat(k[3]), volume: parseFloat(k[5]) }));
+      const klines = src.parse(data);
+      if (Array.isArray(klines) && klines.length >= 10 && klines[0]?.close > 0) {
+        console.log('[SIGNAL] Klines source OK, count:', klines.length);
+        return klines;
       }
     } catch (_) {}
   }
+  console.log('[SIGNAL] All kline sources failed');
   return null;
 }
 
