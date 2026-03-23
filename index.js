@@ -21,9 +21,11 @@ const PORT = process.env.PORT || 4000;
 const REDIS_URL = process.env.REDIS_URL || 'redis://127.0.0.1:6379';
 const FUNCTION_URL = process.env.BASE44_FUNCTION_URL || '';
 const SECRET = process.env.RAILWAY_CLOSE_SECRET || '';
+const BASE44_SERVICE_TOKEN = process.env.BASE44_SERVICE_TOKEN || '';
 
 if (!FUNCTION_URL) { console.error('[FATAL] BASE44_FUNCTION_URL not set!'); process.exit(1); }
 if (!SECRET) { console.error('[FATAL] RAILWAY_CLOSE_SECRET not set!'); process.exit(1); }
+if (!BASE44_SERVICE_TOKEN) { console.error('[FATAL] BASE44_SERVICE_TOKEN not set!'); process.exit(1); }
 console.log('[CONFIG] Function URL:', FUNCTION_URL);
 console.log('[CONFIG] Service token:', BASE44_SERVICE_TOKEN ? 'SET ✓' : 'MISSING ✗');
 
@@ -38,9 +40,6 @@ redis.on('error', (err) => console.error('[REDIS] Error:', err.message));
 // BASE44 FUNCTION CLIENT
 // All DB operations go through railwayCloseTrade function
 // ═══════════════════════════════════════
-const BASE44_SERVICE_TOKEN = process.env.BASE44_SERVICE_TOKEN || '';
-if (!BASE44_SERVICE_TOKEN) { console.error('[FATAL] BASE44_SERVICE_TOKEN not set!'); process.exit(1); }
-
 async function callBase44(action, payload = {}) {
   const res = await axios.post(FUNCTION_URL, { secret: SECRET, action, ...payload }, {
     timeout: 15000,
