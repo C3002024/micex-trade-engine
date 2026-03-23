@@ -119,7 +119,15 @@ async function closeTradeById(tradeId) {
   try {
     const closePrice = getPrice('BTC'); // dummy — function fetches its own price
     const result = await callBase44('close', { trade_id: tradeId, close_price: closePrice });
-    if (result.skipped) return { success: false, reason: result.reason || 'skipped' };
+    if (result.skipped) {
+      // If trade not expired yet, re-schedule with correct delay
+      if (result.reason === 'not_expired_yet' && result.remaining_seconds > 0) {
+        const reDelay = result.remaining_seconds * 1000;
+        console.log(`[CLOSE] ${tradeId} not expired — re-scheduling in ${result.remaining_seconds}s`);
+        await scheduleClose(tradeId, reDelay);
+      }
+      return { success: false, reason: result.reason || 'skipped' };
+    }
     console.log(`[CLOSE] ${tradeId} pnl=${result.pnl_final?.toFixed(2)} reason=${result.close_reason}`);
     return { success: true, ...result };
   } catch (e) {
@@ -217,12 +225,13 @@ function startMonitorService() {
 }
 
 // ═══════════════════════════════════════
-// LIMIT ORDER CHECK (piggyback on price polling)
-// Function tự fetch giá nếu thiếu — luôn gọi ngay cả khi prices trống
+// LIMIT ORDER CHECK (5s interval)
+// Function tự fetch giá nếu thiếu — gọi ngay cả khi prices trống
 // ═══════════════════════════════════════
 function startLimitOrderCheck() {
   setInterval(async () => {
     try {
+      // Always send prices we have; function will self-fetch any missing symbols
       const result = await callBase44('check_limits', { prices });
       if (result.filled > 0 || result.expired > 0 || result.failed > 0) {
         console.log(`[LIMITS] checked=${result.checked} filled=${result.filled} expired=${result.expired} failed=${result.failed || 0}`);
@@ -262,6 +271,7 @@ function startWorker() {
     console.log(`[QUEUE] Processing: ${tradeId}`);
     const result = await closeTradeById(tradeId);
     if (!result.success && result.reason === 'no_price') throw new Error('No price — will retry');
+    // not_expired_yet is handled inside closeTradeById (re-schedules automatically)
     return result;
   }, { connection: redis, concurrency: 10, limiter: { max: 50, duration: 1000 } });
 
