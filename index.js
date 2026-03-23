@@ -168,21 +168,23 @@ async function closeTradeByTpSl(tradeId, closePrice, reason) {
 
 // ═══════════════════════════════════════
 // TP/SL + LIQUIDATION SERVICE (100ms interval — RAM only)
-// Fetches open trades from Base44, checks against live prices
+// Uses CROSS DETECTION: tracks prev price per trade to catch wicks
+// SL has priority over TP when both triggered simultaneously
 // ═══════════════════════════════════════
 let openTradesCache = [];
 let lastTradesFetch = 0;
 const closingSet = new Set(); // prevent duplicate close calls
+const tradePrevPrices = {};   // per-trade previous prices for cross detection
 
 async function refreshOpenTrades() {
   try {
     const result = await callBase44('get_open_trades');
     openTradesCache = result.trades || [];
     lastTradesFetch = Date.now();
-    // Clean up closingSet — remove IDs no longer in open trades
-    for (const id of closingSet) {
-      if (!openTradesCache.find(t => t.id === id)) closingSet.delete(id);
-    }
+    // Clean up closingSet and tradePrevPrices — remove IDs no longer in open trades
+    const activeIds = new Set(openTradesCache.map(t => t.id));
+    for (const id of closingSet) { if (!activeIds.has(id)) closingSet.delete(id); }
+    for (const id of Object.keys(tradePrevPrices)) { if (!activeIds.has(id)) delete tradePrevPrices[id]; }
   } catch (e) {
     console.error('[TRADES] Refresh failed:', e.message);
   }
@@ -193,61 +195,75 @@ function startMonitorService() {
   setInterval(refreshOpenTrades, TRADES_REFRESH_MS);
   
   // High-frequency TP/SL/Liquidation check — 100ms (pure RAM, no network)
+  // CROSS DETECTION: compare prev price vs current price per trade
   setInterval(() => {
     if (openTradesCache.length === 0) return;
     
     for (const trade of openTradesCache) {
-      if (closingSet.has(trade.id)) continue; // already being closed
+      if (closingSet.has(trade.id)) continue;
       const price = getPrice(trade.symbol);
       if (!price || price <= 0) continue;
       
+      const prev = tradePrevPrices[trade.id] || 0;
+      tradePrevPrices[trade.id] = price; // save for next tick
+      if (prev <= 0) continue; // need at least 2 ticks
+      
       const isDemo = trade.wallet_type === 'demo';
       const turbo = trade.turbo_multiplier || 1;
+      let closeReason = null;
+      let closePrice = 0;
       
-      // TP check
-      if (trade.take_profit > 0) {
-        const tpHit = trade.side === 'long' ? price >= trade.take_profit : price <= trade.take_profit;
-        if (tpHit) {
-          closingSet.add(trade.id);
-          console.log(`[TP] ${trade.symbol} price=${price} tp=${trade.take_profit}`);
-          closeTradeByTpSl(trade.id, price, 'take_profit')
-            .then(() => { openTradesCache = openTradesCache.filter(t => t.id !== trade.id); })
-            .catch(() => { closingSet.delete(trade.id); });
-          continue;
-        }
-      }
-      
-      // SL check
+      // SL check FIRST (priority over TP)
       if (trade.stop_loss > 0) {
-        const slHit = trade.side === 'long' ? price <= trade.stop_loss : price >= trade.stop_loss;
-        if (slHit) {
-          closingSet.add(trade.id);
-          console.log(`[SL] ${trade.symbol} price=${price} sl=${trade.stop_loss}`);
-          closeTradeByTpSl(trade.id, price, 'stop_loss')
-            .then(() => { openTradesCache = openTradesCache.filter(t => t.id !== trade.id); })
-            .catch(() => { closingSet.delete(trade.id); });
-          continue;
+        const slCross = trade.side === 'long'
+          ? (prev > trade.stop_loss && price <= trade.stop_loss)   // crossed down
+          : (prev < trade.stop_loss && price >= trade.stop_loss);  // crossed up
+        const slStd = trade.side === 'long' ? price <= trade.stop_loss : price >= trade.stop_loss;
+        if (slCross || slStd) {
+          closeReason = 'stop_loss';
+          closePrice = trade.stop_loss; // close at exact SL price
         }
       }
       
-      // Liquidation check (skip demo)
-      if (isDemo) continue;
-      const liqFactor = turbo >= 5 ? 0.55 : turbo >= 3 ? 0.65 : 0.8;
-      const liq = trade.liquidation_price || (trade.side === 'long'
-        ? trade.entry_price * (1 - liqFactor / trade.leverage)
-        : trade.entry_price * (1 + liqFactor / trade.leverage));
-      const isLiq = trade.side === 'long' ? price <= liq : price >= liq;
-      if (isLiq) {
+      // TP check (only if SL not triggered)
+      if (!closeReason && trade.take_profit > 0) {
+        const tpCross = trade.side === 'long'
+          ? (prev < trade.take_profit && price >= trade.take_profit)  // crossed up
+          : (prev > trade.take_profit && price <= trade.take_profit); // crossed down
+        const tpStd = trade.side === 'long' ? price >= trade.take_profit : price <= trade.take_profit;
+        if (tpCross || tpStd) {
+          closeReason = 'take_profit';
+          closePrice = trade.take_profit; // close at exact TP price
+        }
+      }
+      
+      // Liquidation check (skip demo, only if no TP/SL triggered)
+      if (!closeReason && !isDemo) {
+        const liqFactor = turbo >= 5 ? 0.55 : turbo >= 3 ? 0.65 : 0.8;
+        const liq = trade.liquidation_price || (trade.side === 'long'
+          ? trade.entry_price * (1 - liqFactor / trade.leverage)
+          : trade.entry_price * (1 + liqFactor / trade.leverage));
+        const liqCross = trade.side === 'long'
+          ? (prev > liq && price <= liq)
+          : (prev < liq && price >= liq);
+        const liqStd = trade.side === 'long' ? price <= liq : price >= liq;
+        if (liqCross || liqStd) {
+          closeReason = 'liquidation';
+          closePrice = price; // liquidation uses market price
+        }
+      }
+      
+      if (closeReason) {
         closingSet.add(trade.id);
-        console.log(`[LIQ] ${trade.symbol} price=${price} liq=${liq.toFixed(2)} turbo=x${turbo}`);
-        closeTradeByTpSl(trade.id, price, 'liquidation')
-          .then(() => { openTradesCache = openTradesCache.filter(t => t.id !== trade.id); })
+        console.log(`[${closeReason.toUpperCase()}] ${trade.symbol} prev=${prev} price=${price} close_at=${closePrice} ${trade.side} tp=${trade.take_profit||'-'} sl=${trade.stop_loss||'-'}`);
+        closeTradeByTpSl(trade.id, closePrice, closeReason)
+          .then(() => { openTradesCache = openTradesCache.filter(t => t.id !== trade.id); delete tradePrevPrices[trade.id]; })
           .catch(() => { closingSet.delete(trade.id); });
       }
     }
   }, MONITOR_MS);
   
-  console.log('[MONITOR] TP/SL + Liquidation service started (' + MONITOR_MS + 'ms)');
+  console.log('[MONITOR] TP/SL + Liquidation service started (' + MONITOR_MS + 'ms) with cross detection');
 }
 
 // ═══════════════════════════════════════
@@ -342,6 +358,24 @@ app.post('/notify-new-trade', async (req, res) => {
     }
     console.log(`[NOTIFY] ${trade.id} (${trade.symbol} ${trade.side} mode=${trade.trade_mode||'quick'}) close in ${(delay/1000).toFixed(1)}s`);
     return res.json({ success: true, trade_id: trade.id, delay_ms: delay });
+  } catch (e) { return res.status(500).json({ error: e.message }); }
+});
+
+// TP/SL realtime update — frontend pushes changes instantly (no 3s wait)
+app.post('/notify-tpsl-update', (req, res) => {
+  try {
+    const { secret, trade_id, take_profit, stop_loss } = req.body;
+    if (secret !== SECRET) return res.status(403).json({ error: 'Forbidden' });
+    if (!trade_id) return res.status(400).json({ error: 'Missing trade_id' });
+    const t = openTradesCache.find(t => t.id === trade_id);
+    if (t) {
+      t.take_profit = take_profit || null;
+      t.stop_loss = stop_loss || null;
+      // Reset prev price so cross detection starts fresh with new TP/SL
+      delete tradePrevPrices[trade_id];
+      console.log(`[TPSL-UPDATE] ${trade_id} tp=${take_profit||'-'} sl=${stop_loss||'-'}`);
+    }
+    return res.json({ success: true, found: !!t });
   } catch (e) { return res.status(500).json({ error: e.message }); }
 });
 
