@@ -1,7 +1,9 @@
-// index.js — MICEX Trade Engine V3 (Railway)
+// index.js — MICEX Trade Engine V5 (Railway) — CROSS DETECTION
 // Architecture: Railway = scheduler + price feed + TP/SL/Liq detection
 // Closing trades: calls railwayCloseTrade Base44 function (NOT direct entity API)
-// Price feed: REST polling from multiple sources (Binance WS geo-blocked on Railway)
+// Price feed: REST polling 500ms from multiple sources
+// TP/SL/Liq check: 100ms loop (RAM-only, zero network)
+// Limit order check: 500ms loop with CROSS DETECTION (prev_prices tracking)
 //
 // Railway Variables needed:
 //   REDIS_URL              — auto from Railway Redis addon
@@ -23,11 +25,17 @@ const FUNCTION_URL = process.env.BASE44_FUNCTION_URL || '';
 const SECRET = process.env.RAILWAY_CLOSE_SECRET || '';
 const BASE44_SERVICE_TOKEN = process.env.BASE44_SERVICE_TOKEN || '';
 
+// Timing config (ms)
+const PRICE_POLL_MS = 500;       // REST price fetch interval
+const MONITOR_MS = 100;          // TP/SL/Liquidation check (RAM-only)
+const LIMIT_CHECK_MS = 500;      // Limit order check — fast for cross detection
+const TRADES_REFRESH_MS = 3000;  // Open trades refresh from DB
+
 if (!FUNCTION_URL) { console.error('[FATAL] BASE44_FUNCTION_URL not set!'); process.exit(1); }
 if (!SECRET) { console.error('[FATAL] RAILWAY_CLOSE_SECRET not set!'); process.exit(1); }
 if (!BASE44_SERVICE_TOKEN) { console.error('[FATAL] BASE44_SERVICE_TOKEN not set!'); process.exit(1); }
 console.log('[CONFIG] Function URL:', FUNCTION_URL);
-console.log('[CONFIG] Service token:', BASE44_SERVICE_TOKEN ? 'SET ✓' : 'MISSING ✗');
+console.log('[CONFIG] Intervals: price=' + PRICE_POLL_MS + 'ms monitor=' + MONITOR_MS + 'ms limits=' + LIMIT_CHECK_MS + 'ms');
 
 // ═══════════════════════════════════════
 // REDIS
@@ -49,45 +57,51 @@ async function callBase44(action, payload = {}) {
 }
 
 // ═══════════════════════════════════════
-// PRICE SERVICE — REST polling (WS geo-blocked on Railway)
+// PRICE SERVICE — REST polling 500ms
 // ═══════════════════════════════════════
 const SYMBOLS = ['BTC','ETH','BNB','SOL','XRP','ADA','DOGE','AVAX','DOT','LINK','MATIC','UNI','ATOM','FIL','LTC','APT','ARB','OP','NEAR','SUI'];
 const prices = {};
+const prevPrices = {};  // Previous tick prices for cross detection
+let priceLogCounter = 0;
+let priceFetching = false;
 
 async function fetchPrices() {
-  // Try multiple sources in parallel
-  const sources = [
-    // Binance spot (may be geo-blocked)
-    axios.get('https://api.binance.com/api/v3/ticker/price', { timeout: 5000 })
-      .then(r => { for (const item of r.data) { const sym = item.symbol.replace('USDT',''); if (SYMBOLS.includes(sym) && parseFloat(item.price) > 0) prices[sym] = parseFloat(item.price); } return 'binance'; })
-      .catch(() => null),
-    // Bybit
-    axios.get('https://api.bybit.com/v5/market/tickers?category=linear', { timeout: 5000 })
-      .then(r => { for (const item of (r.data?.result?.list || [])) { const sym = item.symbol.replace('USDT',''); if (SYMBOLS.includes(sym) && parseFloat(item.lastPrice) > 0 && !prices[sym]) prices[sym] = parseFloat(item.lastPrice); } return 'bybit'; })
-      .catch(() => null),
-    // OKX
-    axios.get('https://www.okx.com/api/v5/market/tickers?instType=SPOT', { timeout: 5000 })
-      .then(r => { for (const item of (r.data?.data || [])) { const sym = item.instId?.replace('-USDT',''); if (sym && SYMBOLS.includes(sym) && parseFloat(item.last) > 0 && !prices[sym]) prices[sym] = parseFloat(item.last); } return 'okx'; })
-      .catch(() => null),
-  ];
-  const results = await Promise.allSettled(sources);
-  const loaded = results.filter(r => r.status === 'fulfilled' && r.value).map(r => r.value);
-  
-  // Cache in Redis
-  for (const [sym, price] of Object.entries(prices)) {
-    redis.set(`price:${sym}`, JSON.stringify({ symbol: sym, price, ts: Date.now() }), 'EX', 30).catch(() => {});
-  }
-  
-  console.log(`[PRICE] ${Object.keys(prices).length} prices from [${loaded.join(',')}]`);
+  if (priceFetching) return; // skip if previous fetch still running
+  priceFetching = true;
+  try {
+    // Save previous prices BEFORE updating (for cross detection)
+    for (const sym of SYMBOLS) {
+      if (prices[sym] > 0) prevPrices[sym] = prices[sym];
+    }
+    
+    const newPrices = {};
+    const sources = [
+      axios.get('https://api.binance.com/api/v3/ticker/price', { timeout: 3000 })
+        .then(r => { for (const item of r.data) { const sym = item.symbol.replace('USDT',''); if (SYMBOLS.includes(sym) && parseFloat(item.price) > 0) newPrices[sym] = parseFloat(item.price); } return 'binance'; })
+        .catch(() => null),
+      axios.get('https://api.bybit.com/v5/market/tickers?category=linear', { timeout: 3000 })
+        .then(r => { for (const item of (r.data?.result?.list || [])) { const sym = item.symbol.replace('USDT',''); if (SYMBOLS.includes(sym) && parseFloat(item.lastPrice) > 0 && !newPrices[sym]) newPrices[sym] = parseFloat(item.lastPrice); } return 'bybit'; })
+        .catch(() => null),
+      axios.get('https://www.okx.com/api/v5/market/tickers?instType=SPOT', { timeout: 3000 })
+        .then(r => { for (const item of (r.data?.data || [])) { const sym = item.instId?.replace('-USDT',''); if (sym && SYMBOLS.includes(sym) && parseFloat(item.last) > 0 && !newPrices[sym]) newPrices[sym] = parseFloat(item.last); } return 'okx'; })
+        .catch(() => null),
+    ];
+    await Promise.allSettled(sources);
+    // Update prices atomically
+    for (const [sym, price] of Object.entries(newPrices)) { prices[sym] = price; }
+    // Log only every 20th fetch (~10s) to avoid spam
+    if (++priceLogCounter % 20 === 0) {
+      console.log(`[PRICE] ${Object.keys(prices).length} symbols | BTC=${prices.BTC || '?'} ETH=${prices.ETH || '?'}`);
+    }
+  } finally { priceFetching = false; }
 }
 
 function getPrice(symbol) { return prices[symbol] || 0; }
 
-// Poll prices every 2s
 function startPricePolling() {
   fetchPrices();
-  setInterval(fetchPrices, 2000);
-  console.log('[PRICE] REST polling started (2s interval)');
+  setInterval(fetchPrices, PRICE_POLL_MS);
+  console.log('[PRICE] REST polling started (' + PRICE_POLL_MS + 'ms interval)');
 }
 
 // ═══════════════════════════════════════
@@ -153,31 +167,37 @@ async function closeTradeByTpSl(tradeId, closePrice, reason) {
 }
 
 // ═══════════════════════════════════════
-// TP/SL + LIQUIDATION SERVICE (3s interval)
+// TP/SL + LIQUIDATION SERVICE (100ms interval — RAM only)
 // Fetches open trades from Base44, checks against live prices
 // ═══════════════════════════════════════
 let openTradesCache = [];
 let lastTradesFetch = 0;
+const closingSet = new Set(); // prevent duplicate close calls
 
 async function refreshOpenTrades() {
   try {
     const result = await callBase44('get_open_trades');
     openTradesCache = result.trades || [];
     lastTradesFetch = Date.now();
+    // Clean up closingSet — remove IDs no longer in open trades
+    for (const id of closingSet) {
+      if (!openTradesCache.find(t => t.id === id)) closingSet.delete(id);
+    }
   } catch (e) {
     console.error('[TRADES] Refresh failed:', e.message);
   }
 }
 
 function startMonitorService() {
-  // Refresh open trades every 5s
-  setInterval(refreshOpenTrades, 5000);
+  // Refresh open trades from DB
+  setInterval(refreshOpenTrades, TRADES_REFRESH_MS);
   
-  // Check TP/SL/Liquidation every 3s
-  setInterval(async () => {
+  // High-frequency TP/SL/Liquidation check — 100ms (pure RAM, no network)
+  setInterval(() => {
     if (openTradesCache.length === 0) return;
     
     for (const trade of openTradesCache) {
+      if (closingSet.has(trade.id)) continue; // already being closed
       const price = getPrice(trade.symbol);
       if (!price || price <= 0) continue;
       
@@ -188,9 +208,11 @@ function startMonitorService() {
       if (trade.take_profit > 0) {
         const tpHit = trade.side === 'long' ? price >= trade.take_profit : price <= trade.take_profit;
         if (tpHit) {
+          closingSet.add(trade.id);
           console.log(`[TP] ${trade.symbol} price=${price} tp=${trade.take_profit}`);
-          await closeTradeByTpSl(trade.id, price, 'take_profit');
-          openTradesCache = openTradesCache.filter(t => t.id !== trade.id);
+          closeTradeByTpSl(trade.id, price, 'take_profit')
+            .then(() => { openTradesCache = openTradesCache.filter(t => t.id !== trade.id); })
+            .catch(() => { closingSet.delete(trade.id); });
           continue;
         }
       }
@@ -199,9 +221,11 @@ function startMonitorService() {
       if (trade.stop_loss > 0) {
         const slHit = trade.side === 'long' ? price <= trade.stop_loss : price >= trade.stop_loss;
         if (slHit) {
+          closingSet.add(trade.id);
           console.log(`[SL] ${trade.symbol} price=${price} sl=${trade.stop_loss}`);
-          await closeTradeByTpSl(trade.id, price, 'stop_loss');
-          openTradesCache = openTradesCache.filter(t => t.id !== trade.id);
+          closeTradeByTpSl(trade.id, price, 'stop_loss')
+            .then(() => { openTradesCache = openTradesCache.filter(t => t.id !== trade.id); })
+            .catch(() => { closingSet.delete(trade.id); });
           continue;
         }
       }
@@ -214,34 +238,40 @@ function startMonitorService() {
         : trade.entry_price * (1 + liqFactor / trade.leverage));
       const isLiq = trade.side === 'long' ? price <= liq : price >= liq;
       if (isLiq) {
+        closingSet.add(trade.id);
         console.log(`[LIQ] ${trade.symbol} price=${price} liq=${liq.toFixed(2)} turbo=x${turbo}`);
-        await closeTradeByTpSl(trade.id, price, 'liquidation');
-        openTradesCache = openTradesCache.filter(t => t.id !== trade.id);
+        closeTradeByTpSl(trade.id, price, 'liquidation')
+          .then(() => { openTradesCache = openTradesCache.filter(t => t.id !== trade.id); })
+          .catch(() => { closingSet.delete(trade.id); });
       }
     }
-  }, 3000);
+  }, MONITOR_MS);
   
-  console.log('[MONITOR] TP/SL + Liquidation service started (3s)');
+  console.log('[MONITOR] TP/SL + Liquidation service started (' + MONITOR_MS + 'ms)');
 }
 
 // ═══════════════════════════════════════
-// LIMIT ORDER CHECK (5s interval)
-// Function tự fetch giá nếu thiếu — gọi ngay cả khi prices trống
+// LIMIT ORDER CHECK (500ms interval with cross detection)
+// Sends both current prices AND previous prices to Base44
+// so the function can detect price crossing through trigger levels
 // ═══════════════════════════════════════
+let limitChecking = false;
 function startLimitOrderCheck() {
   setInterval(async () => {
+    if (limitChecking) return; // skip if previous check still running
+    limitChecking = true;
     try {
-      // Always send prices we have; function will self-fetch any missing symbols
-      const result = await callBase44('check_limits', { prices });
+      // Send both current and previous prices for cross detection
+      const result = await callBase44('check_limits', { prices, prev_prices: prevPrices });
       if (result.filled > 0 || result.expired > 0 || result.failed > 0) {
         console.log(`[LIMITS] checked=${result.checked} filled=${result.filled} expired=${result.expired} failed=${result.failed || 0}`);
         await refreshOpenTrades();
       }
     } catch (e) {
       if (!e.message?.includes('timeout')) console.error('[LIMITS] Error:', e.response?.status || e.message, e.response?.data?.error || '');
-    }
-  }, 5000);
-  console.log('[LIMITS] Limit order checker started (5s)');
+    } finally { limitChecking = false; }
+  }, LIMIT_CHECK_MS);
+  console.log('[LIMITS] Limit order checker started (' + LIMIT_CHECK_MS + 'ms) with cross detection');
 }
 
 // ═══════════════════════════════════════
