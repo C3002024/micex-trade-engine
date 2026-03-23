@@ -28,7 +28,7 @@ const BASE44_SERVICE_TOKEN = process.env.BASE44_SERVICE_TOKEN || '';
 // Timing config (ms)
 const PRICE_POLL_MS = 500;       // REST price fetch interval
 const MONITOR_MS = 100;          // TP/SL/Liquidation check (RAM-only)
-const LIMIT_CHECK_MS = 500;      // Limit order check — fast for cross detection
+const LIMIT_CHECK_MS = 2000;     // Limit order check with cross detection
 const TRADES_REFRESH_MS = 3000;  // Open trades refresh from DB
 
 if (!FUNCTION_URL) { console.error('[FATAL] BASE44_FUNCTION_URL not set!'); process.exit(1); }
@@ -251,23 +251,34 @@ function startMonitorService() {
 }
 
 // ═══════════════════════════════════════
-// LIMIT ORDER CHECK (500ms interval with cross detection)
+// LIMIT ORDER CHECK (2s interval with cross detection + error backoff)
 // Sends both current prices AND previous prices to Base44
 // so the function can detect price crossing through trigger levels
 // ═══════════════════════════════════════
 let limitChecking = false;
+let limitErrorCount = 0;
 function startLimitOrderCheck() {
   setInterval(async () => {
     if (limitChecking) return; // skip if previous check still running
+    
+    // Backoff on repeated errors: skip cycles to avoid hammering API
+    if (limitErrorCount > 0) {
+      const skipCycles = Math.min(limitErrorCount * 2, 10); // max 20s backoff
+      limitErrorCount--;
+      return;
+    }
+    
     limitChecking = true;
     try {
       // Send both current and previous prices for cross detection
       const result = await callBase44('check_limits', { prices, prev_prices: prevPrices });
+      limitErrorCount = 0; // reset on success
       if (result.filled > 0 || result.expired > 0 || result.failed > 0) {
         console.log(`[LIMITS] checked=${result.checked} filled=${result.filled} expired=${result.expired} failed=${result.failed || 0}`);
         await refreshOpenTrades();
       }
     } catch (e) {
+      limitErrorCount = Math.min(limitErrorCount + 3, 15); // backoff faster on error
       if (!e.message?.includes('timeout')) console.error('[LIMITS] Error:', e.response?.status || e.message, e.response?.data?.error || '');
     } finally { limitChecking = false; }
   }, LIMIT_CHECK_MS);
