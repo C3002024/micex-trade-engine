@@ -1,5 +1,11 @@
-// index.js — MICEX Trade Engine V2 (Futures Pro + TP/SL + Turbo)
+// index.js — MICEX Trade Engine V3 (Futures Pro + TP/SL + Turbo)
 // All-in-one for Railway deployment
+// Railway Variables needed:
+//   REDIS_URL (auto from Railway Redis addon)
+//   BASE44_FUNCTION_URL (e.g. https://xxx.base44.app/api/functions/railwayCloseTrade)
+//   RAILWAY_CLOSE_SECRET (shared secret)
+//   TELEGRAM_TRADE_BOT_TOKEN (optional)
+//   TELEGRAM_GROUP_CHAT_ID (optional)
 require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
@@ -9,14 +15,18 @@ const WebSocket = require('ws');
 const axios = require('axios');
 
 // ═══════════════════════════════════════
-// CONFIG
+// CONFIG — auto-detect Base44 API from FUNCTION_URL
 // ═══════════════════════════════════════
 const PORT = process.env.PORT || 4000;
 const REDIS_URL = process.env.REDIS_URL || 'redis://127.0.0.1:6379';
-const BASE44_API_URL = process.env.BASE44_API_URL;
-const BASE44_APP_ID = process.env.BASE44_APP_ID;
-const BASE44_SERVICE_TOKEN = process.env.BASE44_SERVICE_TOKEN;
-const TRADE_API_SECRET = process.env.TRADE_API_SECRET;
+const TRADE_API_SECRET = process.env.RAILWAY_CLOSE_SECRET || process.env.TRADE_API_SECRET;
+
+// Derive Base44 API from BASE44_FUNCTION_URL
+// e.g. https://task-flow-pro-furry.base44.app/api/functions/railwayCloseTrade
+//   → baseURL = https://task-flow-pro-furry.base44.app/api
+const FUNCTION_URL = process.env.BASE44_FUNCTION_URL || '';
+const BASE44_BASE = FUNCTION_URL.replace(/\/functions\/.*$/, '') || process.env.BASE44_API_URL;
+const BASE44_SERVICE_TOKEN = process.env.BASE44_SERVICE_TOKEN || process.env.BASE44_SERVICE_ROLE_KEY;
 
 const CLOSE_FEE_RATE = parseFloat(process.env.CLOSE_FEE_RATE || '0.0002');
 const MAX_PROFIT = parseFloat(process.env.MAX_PROFIT_PER_TRADE || '50');
@@ -34,18 +44,35 @@ redis.on('error', (err) => console.error('[REDIS] Error:', err.message));
 // ═══════════════════════════════════════
 // BASE44 CLIENT
 // ═══════════════════════════════════════
+if (!BASE44_BASE) { console.error('[FATAL] BASE44_FUNCTION_URL not set!'); process.exit(1); }
+if (!BASE44_SERVICE_TOKEN) { console.error('[FATAL] BASE44_SERVICE_TOKEN / BASE44_SERVICE_ROLE_KEY not set!'); process.exit(1); }
+console.log('[CONFIG] Base44 API:', BASE44_BASE);
+
 const b44 = axios.create({
-  baseURL: `${BASE44_API_URL}/apps/${BASE44_APP_ID}`,
+  baseURL: BASE44_BASE,
   headers: { 'Authorization': `Bearer ${BASE44_SERVICE_TOKEN}`, 'Content-Type': 'application/json' },
   timeout: 10000,
 });
 
 const entities = {
   async get(name, id) { return (await b44.get(`/entities/${name}/${id}`)).data; },
-  async filter(name, query = {}, sort = '', limit = 50) { return (await b44.post(`/entities/${name}/filter`, { query, sort, limit })).data; },
+  async filter(name, query = {}, sort = '', limit = 50) {
+    return (await b44.post(`/entities/${name}/filter`, { query, sort, limit })).data;
+  },
   async create(name, data) { return (await b44.post(`/entities/${name}`, data)).data; },
   async update(name, id, data) { return (await b44.put(`/entities/${name}/${id}`, data)).data; },
 };
+
+// Quick test: verify API connectivity on startup
+async function testApiConnection() {
+  try {
+    await entities.filter('Trade', { status: 'open' }, '', 1);
+    console.log('[API] Base44 connection OK ✓');
+  } catch (e) {
+    console.error('[API] Base44 connection FAILED:', e.response?.status, e.message);
+    console.error('[API] Check BASE44_FUNCTION_URL and BASE44_SERVICE_TOKEN');
+  }
+}
 
 // ═══════════════════════════════════════
 // PRICE SERVICE
@@ -366,8 +393,8 @@ async function closeTradeById(tradeId) {
     if (closePrice <= 0) closePrice = getPrice(trade.symbol);
     if (closePrice <= 0) {
       try {
-        const r = await axios.get(`https://api.bybit.com/v5/market/tickers?category=linear&symbol=${trade.symbol}USDT`, { timeout: 3000 });
-        const p = parseFloat(r.data?.result?.list?.[0]?.lastPrice);
+        const r = await axios.get(`https://api.binance.com/api/v3/ticker/price?symbol=${trade.symbol}USDT`, { timeout: 3000 });
+        const p = parseFloat(r.data?.price);
         if (p > 0) closePrice = p;
       } catch (_) {}
     }
@@ -603,6 +630,7 @@ app.get('/health', (req, res) => {
 // ═══════════════════════════════════════
 app.listen(PORT, async () => {
   console.log(`[SERVER] Running on port ${PORT}`);
+  await testApiConnection();
   connectPriceWs();
   await fetchRestPrices();
   startWorker();
