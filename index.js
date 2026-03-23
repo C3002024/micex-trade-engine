@@ -12,9 +12,7 @@ const BASE44_FUNCTION_URL = process.env.BASE44_FUNCTION_URL;
 const RAILWAY_SECRET = process.env.RAILWAY_CLOSE_SECRET;
 const PORT = process.env.PORT || 3000;
 
-// ── LIMIT ORDER CONFIG ──
-const LIMIT_ORDER_FUNCTION_URL = process.env.LIMIT_ORDER_FUNCTION_URL || '';
-// ^ Set trong Railway Variables, ví dụ: https://app.base44.com/api/v1/apps/YOUR_APP_ID/functions/checkLimitOrders
+// Limit Order check dùng chung BASE44_FUNCTION_URL (action: check_limits)
 
 // ── TELEGRAM SIGNAL BOT CONFIG ──
 const TG_BOT_TOKEN = process.env.TELEGRAM_TRADE_BOT_TOKEN;
@@ -340,12 +338,13 @@ async function sendSignal() {
 }
 
 // ═══════════════════════════════════════════════════════════
-// LIMIT ORDER CHECK — Gọi checkLimitOrders mỗi 5 giây
+// LIMIT ORDER CHECK — Gọi railwayCloseTrade action=check_limits mỗi 5 giây
+// Dùng chung BASE44_FUNCTION_URL (đã có auth sẵn)
 // ═══════════════════════════════════════════════════════════
 let limitCheckRunning = false;
 
 async function checkLimitOrders() {
-  if (limitCheckRunning) return;
+  if (limitCheckRunning || !BASE44_FUNCTION_URL) return;
   limitCheckRunning = true;
   try {
     // Lấy giá tất cả symbol từ priceCache
@@ -364,23 +363,11 @@ async function checkLimitOrders() {
 
     if (Object.keys(prices).length === 0) { limitCheckRunning = false; return; }
 
-    // Xác định URL function checkLimitOrders
-    let limitUrl = LIMIT_ORDER_FUNCTION_URL;
-    if (!limitUrl && BASE44_FUNCTION_URL) {
-      // Tự suy ra từ BASE44_FUNCTION_URL (thay railwayCloseTrade → checkLimitOrders)
-      limitUrl = BASE44_FUNCTION_URL.replace(/\/railwayCloseTrade\/?$/, '/checkLimitOrders');
-      // Nếu không thay được (URL không chứa railwayCloseTrade), thử thay phần cuối
-      if (limitUrl === BASE44_FUNCTION_URL) {
-        limitUrl = BASE44_FUNCTION_URL.replace(/\/[^/]+\/?$/, '/checkLimitOrders');
-      }
-    }
-
-    if (!limitUrl) { limitCheckRunning = false; return; }
-
-    const res = await fetch(limitUrl, {
+    // Gọi chung BASE44_FUNCTION_URL (railwayCloseTrade) với action=check_limits
+    const res = await fetch(BASE44_FUNCTION_URL, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ secret: RAILWAY_SECRET, prices }),
+      body: JSON.stringify({ secret: RAILWAY_SECRET, action: 'check_limits', prices }),
     });
     const data = await res.json();
     if (data.filled > 0) {
