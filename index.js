@@ -25,6 +25,48 @@ const priceCache = new Map();
 const closingSet = new Set();
 const CACHE_TTL = 1500;
 
+// ── WebSocket live prices (giống chart UI) ──
+const wsPrices = new Map();
+const WebSocket = require('ws');
+const WS_SYMBOLS = ['BTC','ETH','BNB','SOL','XRP','DOGE','ADA','AVAX','DOT','LINK','LTC','APT','ARB','OP','SUI','NEAR','TRX','PEPE','SHIB','UNI','ATOM','FIL','INJ','SEI','MATIC','FET','RENDER','TIA','WIF'];
+
+function connectBinanceWS() {
+  const streams = WS_SYMBOLS.map(s => `${s.toLowerCase()}usdt@trade`).join('/');
+  const wsUrl = `wss://stream.binance.com:9443/stream?streams=${streams}`;
+  
+  let ws;
+  try { ws = new WebSocket(wsUrl); } catch (_) { setTimeout(connectBinanceWS, 5000); return; }
+  
+  ws.on('open', () => {
+    console.log('[WS] Binance WebSocket connected (' + WS_SYMBOLS.length + ' symbols)');
+  });
+  
+  ws.on('message', (raw) => {
+    try {
+      const msg = JSON.parse(raw);
+      if (msg.data && msg.data.s && msg.data.p) {
+        const symbol = msg.data.s.replace('USDT', '');
+        const price = parseFloat(msg.data.p);
+        if (price > 0) {
+          wsPrices.set(symbol, { price, time: Date.now() });
+          // Also update priceCache so fetchPrice() returns WS price
+          priceCache.set(symbol, { price, time: Date.now() });
+        }
+      }
+    } catch (_) {}
+  });
+  
+  ws.on('close', () => {
+    console.log('[WS] Binance WebSocket disconnected, reconnecting in 3s...');
+    setTimeout(connectBinanceWS, 3000);
+  });
+  
+  ws.on('error', (err) => {
+    console.error('[WS] Error:', err.message);
+    try { ws.close(); } catch (_) {}
+  });
+}
+
 // ── CoinGecko ID mapping ──
 const CG_IDS = {
   BTC:'bitcoin',ETH:'ethereum',BNB:'binancecoin',SOL:'solana',
@@ -349,13 +391,17 @@ async function checkLimitOrders() {
   if (limitCheckRunning || !BASE44_FUNCTION_URL) return;
   limitCheckRunning = true;
   try {
-    // Lấy giá tất cả symbol từ priceCache
+    // Ưu tiên giá WebSocket (giống chart UI), fallback REST API
     const prices = {};
+    for (const [sym, data] of wsPrices) {
+      if (data.price > 0 && Date.now() - data.time < 10000) prices[sym] = data.price;
+    }
+    // Bổ sung từ priceCache (REST) cho symbols WS chưa có
     for (const [sym, data] of priceCache) {
-      if (data.price > 0) prices[sym] = data.price;
+      if (!prices[sym] && data.price > 0) prices[sym] = data.price;
     }
 
-    // Nếu chưa có giá thì fetch các coin chính
+    // Nếu WS chưa kết nối thì fetch REST
     if (Object.keys(prices).length === 0) {
       const mainCoins = ['BTC', 'ETH', 'BNB', 'SOL', 'XRP', 'DOGE', 'ADA', 'AVAX', 'DOT', 'LINK', 'LTC', 'APT', 'ARB', 'OP', 'SUI', 'NEAR'];
       await Promise.allSettled(mainCoins.map(async (sym) => {
@@ -458,6 +504,9 @@ app.get('/status', (req, res) => {
 app.listen(PORT, () => {
   console.log(`[MICEX] Trade Engine v3 + Limit Orders running on port ${PORT}`);
   console.log(`[MICEX] BASE44_FUNCTION_URL: ${BASE44_FUNCTION_URL}`);
+
+  // Connect Binance WebSocket for real-time prices (giống chart UI)
+  connectBinanceWS();
 
   // Sync open trades on startup
   syncOpenTrades();
