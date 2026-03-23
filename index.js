@@ -189,6 +189,7 @@ async function closeTrade(tradeId, symbol, reason = 'time_expired') {
         action: 'close',
         trade_id: tradeId,
         close_price: closePrice,
+        close_reason: reason,
       }),
     });
     const data = await res.json();
@@ -271,6 +272,25 @@ async function liquidationLoop() {
       if (isLiquidated(trade, price)) {
         console.log(`[LIQUIDATION] Trade ${tradeId} ${trade.symbol} ${trade.side} at ${price}`);
         closeTrade(tradeId, trade.symbol, 'liquidation');
+        continue;
+      }
+
+      // ── TP/SL CHECK (Futures Pro) ──
+      if (trade.take_profit && trade.take_profit > 0) {
+        const tpHit = trade.side === 'long' ? price >= trade.take_profit : price <= trade.take_profit;
+        if (tpHit) {
+          console.log(`[TP] Trade ${tradeId} ${trade.symbol} ${trade.side} TP=${trade.take_profit} price=${price}`);
+          closeTrade(tradeId, trade.symbol, 'take_profit');
+          continue;
+        }
+      }
+      if (trade.stop_loss && trade.stop_loss > 0) {
+        const slHit = trade.side === 'long' ? price <= trade.stop_loss : price >= trade.stop_loss;
+        if (slHit) {
+          console.log(`[SL] Trade ${tradeId} ${trade.symbol} ${trade.side} SL=${trade.stop_loss} price=${price}`);
+          closeTrade(tradeId, trade.symbol, 'stop_loss');
+          continue;
+        }
       }
     }
   } catch (err) {
