@@ -343,6 +343,8 @@ async function sendSignal() {
 // ═══════════════════════════════════════════════════════════
 let limitCheckRunning = false;
 
+let limitCheckCount = 0;
+
 async function checkLimitOrders() {
   if (limitCheckRunning || !BASE44_FUNCTION_URL) return;
   limitCheckRunning = true;
@@ -355,13 +357,26 @@ async function checkLimitOrders() {
 
     // Nếu chưa có giá thì fetch các coin chính
     if (Object.keys(prices).length === 0) {
-      for (const sym of ['BTC', 'ETH', 'BNB', 'SOL', 'XRP']) {
+      const mainCoins = ['BTC', 'ETH', 'BNB', 'SOL', 'XRP', 'DOGE', 'ADA', 'AVAX', 'DOT', 'LINK', 'LTC', 'APT', 'ARB', 'OP', 'SUI', 'NEAR'];
+      await Promise.allSettled(mainCoins.map(async (sym) => {
         const p = await fetchPrice(sym);
         if (p > 0) prices[sym] = p;
-      }
+      }));
     }
 
-    if (Object.keys(prices).length === 0) { limitCheckRunning = false; return; }
+    limitCheckCount++;
+    const symCount = Object.keys(prices).length;
+    if (symCount === 0) {
+      console.log(`[LIMIT] Check #${limitCheckCount} — NO PRICES available, skipping`);
+      limitCheckRunning = false;
+      return;
+    }
+
+    // Log mỗi 12 lần (~60 giây) hoặc khi có kết quả
+    const shouldLog = limitCheckCount % 12 === 1;
+    if (shouldLog) {
+      console.log(`[LIMIT] Check #${limitCheckCount} — ${symCount} symbols, BTC=${prices.BTC || 'N/A'}`);
+    }
 
     // Gọi chung BASE44_FUNCTION_URL (railwayCloseTrade) với action=check_limits
     const res = await fetch(BASE44_FUNCTION_URL, {
@@ -370,14 +385,21 @@ async function checkLimitOrders() {
       body: JSON.stringify({ secret: RAILWAY_SECRET, action: 'check_limits', prices }),
     });
     const data = await res.json();
+
     if (data.filled > 0) {
-      console.log(`[LIMIT] Filled ${data.filled} limit orders`);
+      console.log(`[LIMIT] ✅ Filled ${data.filled} limit orders`);
     }
     if (data.expired > 0) {
-      console.log(`[LIMIT] Expired ${data.expired} limit orders`);
+      console.log(`[LIMIT] ⏰ Expired ${data.expired} limit orders`);
+    }
+    if (data.failed > 0) {
+      console.log(`[LIMIT] ❌ Failed ${data.failed} limit orders`);
+    }
+    if (data.error) {
+      console.error(`[LIMIT] API Error: ${data.error}`);
     }
   } catch (err) {
-    // Silent — không crash loop
+    console.error(`[LIMIT] Check error: ${err.message}`);
   }
   limitCheckRunning = false;
 }
