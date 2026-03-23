@@ -218,19 +218,18 @@ function startMonitorService() {
 
 // ═══════════════════════════════════════
 // LIMIT ORDER CHECK (piggyback on price polling)
+// Function tự fetch giá nếu thiếu — luôn gọi ngay cả khi prices trống
 // ═══════════════════════════════════════
 function startLimitOrderCheck() {
   setInterval(async () => {
-    if (Object.keys(prices).length === 0) return;
     try {
       const result = await callBase44('check_limits', { prices });
-      if (result.filled > 0 || result.expired > 0) {
-        console.log(`[LIMITS] checked=${result.checked} filled=${result.filled} expired=${result.expired}`);
-        // Refresh open trades cache since new trades may have been created
+      if (result.filled > 0 || result.expired > 0 || result.failed > 0) {
+        console.log(`[LIMITS] checked=${result.checked} filled=${result.filled} expired=${result.expired} failed=${result.failed || 0}`);
         await refreshOpenTrades();
       }
     } catch (e) {
-      if (!e.message?.includes('timeout')) console.error('[LIMITS]', e.message);
+      if (!e.message?.includes('timeout')) console.error('[LIMITS] Error:', e.response?.status || e.message, e.response?.data?.error || '');
     }
   }, 5000);
   console.log('[LIMITS] Limit order checker started (5s)');
