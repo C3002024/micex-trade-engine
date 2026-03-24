@@ -213,12 +213,19 @@ function startMonitorService() {
       let closeReason = null;
       let closePrice = 0;
       
+      // SAFETY: Validate TP/SL direction before checking
+      // LONG: TP must be > entry, SL must be < entry
+      // SHORT: TP must be < entry, SL must be > entry
+      const isLong = trade.side === 'long';
+      const validTP = trade.take_profit > 0 && (isLong ? trade.take_profit > trade.entry_price : trade.take_profit < trade.entry_price);
+      const validSL = trade.stop_loss > 0 && (isLong ? trade.stop_loss < trade.entry_price : trade.stop_loss > trade.entry_price);
+      
       // SL check FIRST (priority over TP)
-      if (trade.stop_loss > 0) {
-        const slCross = trade.side === 'long'
+      if (validSL) {
+        const slCross = isLong
           ? (prev > trade.stop_loss && price <= trade.stop_loss)   // crossed down
           : (prev < trade.stop_loss && price >= trade.stop_loss);  // crossed up
-        const slStd = trade.side === 'long' ? price <= trade.stop_loss : price >= trade.stop_loss;
+        const slStd = isLong ? price <= trade.stop_loss : price >= trade.stop_loss;
         if (slCross || slStd) {
           closeReason = 'stop_loss';
           closePrice = trade.stop_loss; // close at exact SL price
@@ -226,11 +233,11 @@ function startMonitorService() {
       }
       
       // TP check (only if SL not triggered)
-      if (!closeReason && trade.take_profit > 0) {
-        const tpCross = trade.side === 'long'
+      if (!closeReason && validTP) {
+        const tpCross = isLong
           ? (prev < trade.take_profit && price >= trade.take_profit)  // crossed up
           : (prev > trade.take_profit && price <= trade.take_profit); // crossed down
-        const tpStd = trade.side === 'long' ? price >= trade.take_profit : price <= trade.take_profit;
+        const tpStd = isLong ? price >= trade.take_profit : price <= trade.take_profit;
         if (tpCross || tpStd) {
           closeReason = 'take_profit';
           closePrice = trade.take_profit; // close at exact TP price
