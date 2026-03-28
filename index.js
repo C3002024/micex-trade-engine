@@ -1,13 +1,15 @@
-// index.js — MICEX Trade Engine V5 (Railway) — CROSS DETECTION
-// Architecture: Railway = scheduler + price feed + TP/SL/Liq detection
+// index.js — MICEX Trade Engine V5.1 (Railway) — CROSS DETECTION + BO CANDLE TICKER
+// Architecture: Railway = scheduler + price feed + TP/SL/Liq detection + BO candle ticker
 // Closing trades: calls railwayCloseTrade Base44 function (NOT direct entity API)
 // Price feed: REST polling 500ms from multiple sources
 // TP/SL/Liq check: 100ms loop (RAM-only, zero network)
-// Limit order check: 500ms loop with CROSS DETECTION (prev_prices tracking)
+// Limit order check: 2000ms loop with CROSS DETECTION (prev_prices tracking)
+// BO Candle Ticker: 5s loop — sends verified prices to boCandleEngine
 //
 // Railway Variables needed:
 //   REDIS_URL              — auto from Railway Redis addon
 //   BASE44_FUNCTION_URL    — https://xxx.base44.app/api/functions/railwayCloseTrade
+//   BASE44_SERVICE_TOKEN   — service role key from Base44
 //   RAILWAY_CLOSE_SECRET   — shared secret (same as Base44 secret)
 require('dotenv').config();
 const express = require('express');
@@ -60,13 +62,14 @@ async function callBase44(action, payload = {}) {
 // PRICE SERVICE — REST polling 500ms
 // ═══════════════════════════════════════
 const SYMBOLS = ['BTC','ETH','BNB','SOL','XRP','ADA','DOGE','AVAX','DOT','LINK','MATIC','UNI','ATOM','FIL','LTC','APT','ARB','OP','NEAR','SUI'];
+const ALL_TRADE_SYMBOLS = [...SYMBOLS, 'MICEX'];
 const prices = {};
-const prevPrices = {};  // Previous tick prices for cross detection
+const prevPrices = {};
 let priceLogCounter = 0;
 let priceFetching = false;
 
 async function fetchPrices() {
-  if (priceFetching) return; // skip if previous fetch still running
+  if (priceFetching) return;
   priceFetching = true;
   try {
     // Save previous prices BEFORE updating (for cross detection)
@@ -87,9 +90,7 @@ async function fetchPrices() {
         .catch(() => null),
     ];
     await Promise.allSettled(sources);
-    // Update prices atomically
     for (const [sym, price] of Object.entries(newPrices)) { prices[sym] = price; }
-    // Log only every 20th fetch (~10s) to avoid spam
     if (++priceLogCounter % 20 === 0) {
       console.log(`[PRICE] ${Object.keys(prices).length} symbols | BTC=${prices.BTC || '?'} ETH=${prices.ETH || '?'}`);
     }
@@ -131,10 +132,9 @@ async function closeTradeById(tradeId) {
   const locked = await redis.set(lockKey, '1', 'NX', 'EX', 30);
   if (!locked) return { success: false, reason: 'lock_held' };
   try {
-    const closePrice = getPrice('BTC'); // dummy — function fetches its own price
+    const closePrice = getPrice('BTC');
     const result = await callBase44('close', { trade_id: tradeId, close_price: closePrice });
     if (result.skipped) {
-      // If trade not expired yet, re-schedule with correct delay
       if (result.reason === 'not_expired_yet' && result.remaining_seconds > 0) {
         const reDelay = result.remaining_seconds * 1000;
         console.log(`[CLOSE] ${tradeId} not expired — re-scheduling in ${result.remaining_seconds}s`);
@@ -173,15 +173,14 @@ async function closeTradeByTpSl(tradeId, closePrice, reason) {
 // ═══════════════════════════════════════
 let openTradesCache = [];
 let lastTradesFetch = 0;
-const closingSet = new Set(); // prevent duplicate close calls
-const tradePrevPrices = {};   // per-trade previous prices for cross detection
+const closingSet = new Set();
+const tradePrevPrices = {};
 
 async function refreshOpenTrades() {
   try {
     const result = await callBase44('get_open_trades');
     openTradesCache = result.trades || [];
     lastTradesFetch = Date.now();
-    // Clean up closingSet and tradePrevPrices — remove IDs no longer in open trades
     const activeIds = new Set(openTradesCache.map(t => t.id));
     for (const id of closingSet) { if (!activeIds.has(id)) closingSet.delete(id); }
     for (const id of Object.keys(tradePrevPrices)) { if (!activeIds.has(id)) delete tradePrevPrices[id]; }
@@ -191,11 +190,8 @@ async function refreshOpenTrades() {
 }
 
 function startMonitorService() {
-  // Refresh open trades from DB
   setInterval(refreshOpenTrades, TRADES_REFRESH_MS);
   
-  // High-frequency TP/SL/Liquidation check — 100ms (pure RAM, no network)
-  // CROSS DETECTION: compare prev price vs current price per trade
   setInterval(() => {
     if (openTradesCache.length === 0) return;
     
@@ -205,17 +201,14 @@ function startMonitorService() {
       if (!price || price <= 0) continue;
       
       const prev = tradePrevPrices[trade.id] || 0;
-      tradePrevPrices[trade.id] = price; // save for next tick
-      if (prev <= 0) continue; // need at least 2 ticks
+      tradePrevPrices[trade.id] = price;
+      if (prev <= 0) continue;
       
       const isDemo = trade.wallet_type === 'demo';
       const turbo = trade.turbo_multiplier || 1;
       let closeReason = null;
       let closePrice = 0;
       
-      // SAFETY: Validate TP/SL direction before checking
-      // LONG: TP must be > entry, SL must be < entry
-      // SHORT: TP must be < entry, SL must be > entry
       const isLong = trade.side === 'long';
       const validTP = trade.take_profit > 0 && (isLong ? trade.take_profit > trade.entry_price : trade.take_profit < trade.entry_price);
       const validSL = trade.stop_loss > 0 && (isLong ? trade.stop_loss < trade.entry_price : trade.stop_loss > trade.entry_price);
@@ -223,28 +216,28 @@ function startMonitorService() {
       // SL check FIRST (priority over TP)
       if (validSL) {
         const slCross = isLong
-          ? (prev > trade.stop_loss && price <= trade.stop_loss)   // crossed down
-          : (prev < trade.stop_loss && price >= trade.stop_loss);  // crossed up
+          ? (prev > trade.stop_loss && price <= trade.stop_loss)
+          : (prev < trade.stop_loss && price >= trade.stop_loss);
         const slStd = isLong ? price <= trade.stop_loss : price >= trade.stop_loss;
         if (slCross || slStd) {
           closeReason = 'stop_loss';
-          closePrice = trade.stop_loss; // close at exact SL price
+          closePrice = trade.stop_loss;
         }
       }
       
       // TP check (only if SL not triggered)
       if (!closeReason && validTP) {
         const tpCross = isLong
-          ? (prev < trade.take_profit && price >= trade.take_profit)  // crossed up
-          : (prev > trade.take_profit && price <= trade.take_profit); // crossed down
+          ? (prev < trade.take_profit && price >= trade.take_profit)
+          : (prev > trade.take_profit && price <= trade.take_profit);
         const tpStd = isLong ? price >= trade.take_profit : price <= trade.take_profit;
         if (tpCross || tpStd) {
           closeReason = 'take_profit';
-          closePrice = trade.take_profit; // close at exact TP price
+          closePrice = trade.take_profit;
         }
       }
       
-      // Liquidation check (skip demo, only if no TP/SL triggered)
+      // Liquidation check (skip demo)
       if (!closeReason && !isDemo) {
         const liqFactor = turbo >= 5 ? 0.55 : turbo >= 3 ? 0.65 : 0.8;
         const liq = trade.liquidation_price || (trade.side === 'long'
@@ -256,7 +249,7 @@ function startMonitorService() {
         const liqStd = trade.side === 'long' ? price <= liq : price >= liq;
         if (liqCross || liqStd) {
           closeReason = 'liquidation';
-          closePrice = price; // liquidation uses market price
+          closePrice = price;
         }
       }
       
@@ -275,33 +268,29 @@ function startMonitorService() {
 
 // ═══════════════════════════════════════
 // LIMIT ORDER CHECK (2s interval with cross detection + error backoff)
-// Sends both current prices AND previous prices to Base44
-// so the function can detect price crossing through trigger levels
 // ═══════════════════════════════════════
 let limitChecking = false;
 let limitErrorCount = 0;
 function startLimitOrderCheck() {
   setInterval(async () => {
-    if (limitChecking) return; // skip if previous check still running
+    if (limitChecking) return;
     
-    // Backoff on repeated errors: skip cycles to avoid hammering API
     if (limitErrorCount > 0) {
-      const skipCycles = Math.min(limitErrorCount * 2, 10); // max 20s backoff
+      const skipCycles = Math.min(limitErrorCount * 2, 10);
       limitErrorCount--;
       return;
     }
     
     limitChecking = true;
     try {
-      // Send both current and previous prices for cross detection
       const result = await callBase44('check_limits', { prices, prev_prices: prevPrices });
-      limitErrorCount = 0; // reset on success
+      limitErrorCount = 0;
       if (result.filled > 0 || result.expired > 0 || result.failed > 0) {
         console.log(`[LIMITS] checked=${result.checked} filled=${result.filled} expired=${result.expired} failed=${result.failed || 0}`);
         await refreshOpenTrades();
       }
     } catch (e) {
-      limitErrorCount = Math.min(limitErrorCount + 3, 15); // backoff faster on error
+      limitErrorCount = Math.min(limitErrorCount + 3, 15);
       if (!e.message?.includes('timeout')) console.error('[LIMITS] Error:', e.response?.status || e.message, e.response?.data?.error || '');
     } finally { limitChecking = false; }
   }, LIMIT_CHECK_MS);
@@ -309,7 +298,7 @@ function startLimitOrderCheck() {
 }
 
 // ═══════════════════════════════════════
-// RECOVERY SERVICE — schedule close jobs for open trades
+// RECOVERY SERVICE
 // ═══════════════════════════════════════
 async function recoverOpenTrades() {
   console.log('[RECOVERY] Scanning...');
@@ -327,7 +316,7 @@ async function recoverOpenTrades() {
 }
 
 // ═══════════════════════════════════════
-// QUEUE WORKER — processes scheduled close jobs
+// QUEUE WORKER
 // ═══════════════════════════════════════
 function startWorker() {
   const worker = new Worker('trade-close', async (job) => {
@@ -335,13 +324,56 @@ function startWorker() {
     console.log(`[QUEUE] Processing: ${tradeId}`);
     const result = await closeTradeById(tradeId);
     if (!result.success && result.reason === 'no_price') throw new Error('No price — will retry');
-    // not_expired_yet is handled inside closeTradeById (re-schedules automatically)
     return result;
   }, { connection: redis, concurrency: 10, limiter: { max: 50, duration: 1000 } });
 
   worker.on('completed', (job, result) => { if (result?.success) console.log(`[QUEUE] ✓ ${job.data.tradeId}`); });
   worker.on('failed', (job, err) => { console.error(`[QUEUE] ✗ ${job?.data?.tradeId}: ${err.message}`); });
   console.log('[QUEUE] Worker started');
+}
+
+// ═══════════════════════════════════════
+// BO CANDLE TICKER — mỗi 5s gửi giá từ Railway → Base44 boCandleEngine
+// Đảm bảo nến BO luôn cập nhật real-time bằng giá chính xác từ exchange
+// ═══════════════════════════════════════
+const BO_SYMBOLS = ['BTC', 'ETH', 'BNB', 'SOL', 'XRP'];
+const BO_TICK_MS = 5000;
+let boTickRunning = false;
+let boTickCount = 0;
+
+async function boCandleTick() {
+  if (boTickRunning) return;
+  boTickRunning = true;
+  try {
+    const boPrices = {};
+    for (const sym of BO_SYMBOLS) {
+      const p = getPrice(sym);
+      if (p > 0) boPrices[sym] = p;
+    }
+    
+    if (Object.keys(boPrices).length === 0) {
+      boTickRunning = false;
+      return;
+    }
+    
+    // Send prices to boCandleEngine via railwayCloseTrade proxy
+    await callBase44('bo_tick', { prices: boPrices });
+    
+    if (++boTickCount % 12 === 0) {
+      console.log(`[BO-TICK] ${Object.keys(boPrices).length} symbols sent | BTC=${boPrices.BTC || '?'}`);
+    }
+  } catch (e) {
+    if (boTickCount % 12 === 0) {
+      console.error('[BO-TICK] Error:', e.response?.status || e.message);
+    }
+  } finally {
+    boTickRunning = false;
+  }
+}
+
+function startBOCandleTicker() {
+  setInterval(boCandleTick, BO_TICK_MS);
+  console.log('[BO-TICK] Candle ticker started (' + BO_TICK_MS + 'ms interval)');
 }
 
 // ═══════════════════════════════════════
@@ -359,7 +391,6 @@ app.post('/notify-new-trade', async (req, res) => {
     if (!trade?.id || !trade?.close_time) return res.status(400).json({ error: 'Missing data' });
     const delay = Math.max(0, new Date(trade.close_time).getTime() - Date.now());
     await scheduleClose(trade.id, delay);
-    // Also add to local cache for immediate TP/SL monitoring
     if (!openTradesCache.find(t => t.id === trade.id)) {
       openTradesCache.push(trade);
     }
@@ -368,7 +399,7 @@ app.post('/notify-new-trade', async (req, res) => {
   } catch (e) { return res.status(500).json({ error: e.message }); }
 });
 
-// TP/SL realtime update — frontend pushes changes instantly (no 3s wait)
+// TP/SL realtime update
 app.post('/notify-tpsl-update', (req, res) => {
   try {
     const { secret, trade_id, take_profit, stop_loss } = req.body;
@@ -378,7 +409,6 @@ app.post('/notify-tpsl-update', (req, res) => {
     if (t) {
       t.take_profit = take_profit || null;
       t.stop_loss = stop_loss || null;
-      // Reset prev price so cross detection starts fresh with new TP/SL
       delete tradePrevPrices[trade_id];
       console.log(`[TPSL-UPDATE] ${trade_id} tp=${take_profit||'-'} sl=${stop_loss||'-'}`);
     }
@@ -391,6 +421,7 @@ app.get('/health', (req, res) => {
     status: 'ok', uptime: process.uptime(),
     prices: Object.keys(prices).length,
     open_trades: openTradesCache.length,
+    bo_tick_count: boTickCount,
     timestamp: Date.now(),
   });
 });
@@ -415,5 +446,6 @@ app.listen(PORT, async () => {
   await recoverOpenTrades();
   startMonitorService();
   startLimitOrderCheck();
-  console.log('[SERVER] All services ready ✓');
+  startBOCandleTicker();
+  console.log('[SERVER] All services ready ✓ (with BO candle ticker)');
 });
