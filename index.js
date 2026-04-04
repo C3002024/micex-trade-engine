@@ -1,16 +1,17 @@
-// index.js — MICEX Trade Engine V5.1 (Railway) — CROSS DETECTION + BO CANDLE TICKER
-// Architecture: Railway = scheduler + price feed + TP/SL/Liq detection + BO candle ticker
+// index.js — MICEX Trade Engine V5.2 (Railway) — CROSS DETECTION + BO CANDLE TICKER + SIGNAL BOT
+// Architecture: Railway = scheduler + price feed + TP/SL/Liq detection + BO candle ticker + signal bot
 // Closing trades: calls railwayCloseTrade Base44 function (NOT direct entity API)
 // Price feed: REST polling 500ms from multiple sources
 // TP/SL/Liq check: 100ms loop (RAM-only, zero network)
 // Limit order check: 2000ms loop with CROSS DETECTION (prev_prices tracking)
-// BO Candle Ticker: 5s loop — sends verified prices to boCandleEngine
+// BO Candle Ticker: 1s loop — sends verified prices to boCandleEngine
 //
 // Railway Variables needed:
 //   REDIS_URL              — auto from Railway Redis addon
 //   BASE44_FUNCTION_URL    — https://xxx.base44.app/api/functions/railwayCloseTrade
 //   BASE44_SERVICE_TOKEN   — service role key from Base44
 //   RAILWAY_CLOSE_SECRET   — shared secret (same as Base44 secret)
+//   BASE44_SIGNAL_URL      — https://xxx.base44.app/api/functions/boSignalBot (optional)
 require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
@@ -337,7 +338,7 @@ function startWorker() {
 // Đảm bảo nến BO luôn cập nhật real-time bằng giá chính xác từ exchange
 // ═══════════════════════════════════════
 const BO_SYMBOLS = ['BTC', 'ETH', 'BNB', 'SOL', 'XRP'];
-const BO_TICK_MS = 5000;
+const BO_TICK_MS = 1000;
 let boTickRunning = false;
 let boTickCount = 0;
 
@@ -374,6 +375,50 @@ async function boCandleTick() {
 function startBOCandleTicker() {
   setInterval(boCandleTick, BO_TICK_MS);
   console.log('[BO-TICK] Candle ticker started (' + BO_TICK_MS + 'ms interval)');
+}
+
+// ═══════════════════════════════════════
+// BO SIGNAL BOT — Gọi boSignalBot Base44 function mỗi 60s
+// Gửi tín hiệu Martingale + Win Streak vào kênh Telegram
+// ═══════════════════════════════════════
+const BO_SIGNAL_URL = (process.env.BASE44_SIGNAL_URL || '').trim();
+const BO_SIGNAL_MS = 60 * 1000;
+let signalRunning = false;
+let signalCount = 0;
+
+async function runBOSignal() {
+  if (signalRunning || !BO_SIGNAL_URL) return;
+  signalRunning = true;
+  try {
+    // Đợi đến giây thứ 5 của phút (phiên BO bắt đầu giây 0, gửi signal lúc giây 5)
+    const now = Date.now();
+    const secInMinute = Math.floor((now / 1000) % 60);
+    if (secInMinute < 3 || secInMinute > 10) {
+      signalRunning = false;
+      return; // Chỉ gửi trong khoảng giây 3-10 của phút
+    }
+    
+    const res = await axios.post(BO_SIGNAL_URL, { action: 'send_signal' }, {
+      timeout: 15000,
+      headers: { 'Authorization': `Bearer ${BASE44_SERVICE_TOKEN}` },
+    });
+    signalCount++;
+    console.log(`[BO-SIGNAL] #${signalCount} ${res.data?.direction || '?'} x${res.data?.multiplier || '?'} round=${res.data?.round_id || '?'}`);
+  } catch (e) {
+    console.error('[BO-SIGNAL] Error:', e.response?.status || e.message);
+  } finally {
+    signalRunning = false;
+  }
+}
+
+function startBOSignalBot() {
+  if (!BO_SIGNAL_URL) {
+    console.log('[BO-SIGNAL] Skipped — BASE44_SIGNAL_URL not set');
+    return;
+  }
+  // Check mỗi 5s, chỉ gửi khi đúng timing (giây 3-10 của phút)
+  setInterval(runBOSignal, 5000);
+  console.log('[BO-SIGNAL] Signal bot started (every 60s at second 5)');
 }
 
 // ═══════════════════════════════════════
@@ -422,6 +467,7 @@ app.get('/health', (req, res) => {
     prices: Object.keys(prices).length,
     open_trades: openTradesCache.length,
     bo_tick_count: boTickCount,
+    signal_count: signalCount,
     timestamp: Date.now(),
   });
 });
@@ -447,5 +493,6 @@ app.listen(PORT, async () => {
   startMonitorService();
   startLimitOrderCheck();
   startBOCandleTicker();
-  console.log('[SERVER] All services ready ✓ (with BO candle ticker)');
+  startBOSignalBot();
+  console.log('[SERVER] All services ready ✓ (with BO candle ticker + signal bot)');
 });
