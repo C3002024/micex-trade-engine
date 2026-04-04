@@ -398,9 +398,8 @@ async function runBOSignal() {
       return; // Chỉ gửi trong khoảng giây 3-10 của phút
     }
     
-    const res = await axios.post(BO_SIGNAL_URL, { action: 'send_signal' }, {
+    const res = await axios.post(BO_SIGNAL_URL, { action: 'send_signal', secret: SECRET }, {
       timeout: 15000,
-      headers: { 'Authorization': `Bearer ${BASE44_SERVICE_TOKEN}` },
     });
     signalCount++;
     console.log(`[BO-SIGNAL] #${signalCount} ${res.data?.direction || '?'} x${res.data?.multiplier || '?'} round=${res.data?.round_id || '?'}`);
