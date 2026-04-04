@@ -11,7 +11,7 @@
 //   BASE44_FUNCTION_URL    — https://xxx.base44.app/api/functions/railwayCloseTrade
 //   BASE44_SERVICE_TOKEN   — service role key from Base44
 //   RAILWAY_CLOSE_SECRET   — shared secret (same as Base44 secret)
-//   BASE44_SIGNAL_URL      — https://xxx.base44.app/api/functions/boSignalBot (optional)
+//   (Signal bot now uses railwayCloseTrade proxy — no separate URL needed)
 require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
@@ -378,16 +378,14 @@ function startBOCandleTicker() {
 }
 
 // ═══════════════════════════════════════
-// BO SIGNAL BOT — Gọi boSignalBot Base44 function mỗi 60s
+// BO SIGNAL BOT — Gọi signal qua railwayCloseTrade proxy (cùng URL, không cần URL riêng)
 // Gửi tín hiệu Martingale + Win Streak vào kênh Telegram
 // ═══════════════════════════════════════
-const BO_SIGNAL_URL = (process.env.BASE44_SIGNAL_URL || '').trim();
-const BO_SIGNAL_MS = 60 * 1000;
 let signalRunning = false;
 let signalCount = 0;
 
 async function runBOSignal() {
-  if (signalRunning || !BO_SIGNAL_URL) return;
+  if (signalRunning) return;
   signalRunning = true;
   try {
     // Đợi đến giây thứ 5 của phút (phiên BO bắt đầu giây 0, gửi signal lúc giây 5)
@@ -398,11 +396,10 @@ async function runBOSignal() {
       return; // Chỉ gửi trong khoảng giây 3-10 của phút
     }
     
-    const res = await axios.post(BO_SIGNAL_URL, { action: 'send_signal', secret: SECRET }, {
-      timeout: 15000,
-    });
+    // Gọi qua railwayCloseTrade (cùng FUNCTION_URL đã hoạt động OK)
+    const res = await callBase44('send_signal');
     signalCount++;
-    console.log(`[BO-SIGNAL] #${signalCount} ${res.data?.direction || '?'} x${res.data?.multiplier || '?'} round=${res.data?.round_id || '?'}`);
+    console.log(`[BO-SIGNAL] #${signalCount} ${res?.direction || '?'} x${res?.multiplier || '?'} round=${res?.round_id || '?'}`);
   } catch (e) {
     console.error('[BO-SIGNAL] Error:', e.response?.status || e.message);
   } finally {
@@ -411,10 +408,6 @@ async function runBOSignal() {
 }
 
 function startBOSignalBot() {
-  if (!BO_SIGNAL_URL) {
-    console.log('[BO-SIGNAL] Skipped — BASE44_SIGNAL_URL not set');
-    return;
-  }
   // Check mỗi 5s, chỉ gửi khi đúng timing (giây 3-10 của phút)
   setInterval(runBOSignal, 5000);
   console.log('[BO-SIGNAL] Signal bot started (every 60s at second 5)');
